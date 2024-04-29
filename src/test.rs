@@ -48,9 +48,10 @@ pub fn generate_random_egraph() -> EGraph {
             eclass += 1;
         }
 
+        let id = nodes.len();
         nodes.push(Node {
-            op: "operation".to_string(),
-            children: children,
+            op: format!("operation{}", id), // unique operation name, otherwise congruence may be violated
+            children,
             eclass: eclass.to_string().clone().into(),
             cost: get_semi_random_cost(&nodes),
         });
@@ -59,8 +60,9 @@ pub fn generate_random_egraph() -> EGraph {
     // So far we have the nodes for a feasible egraph. Now we add some
     // cycles to extra nodes - nodes that aren't required in the extraction.
     for _ in 0..extra_node_count {
+        let id = nodes.len();
         nodes.push(Node {
-            op: "operation".to_string(),
+            op: format!("operation{}", id), // unique operation name, otherwise congruence may be violated
             children: vec![],
             eclass: rng.gen_range(0..eclass * 2 + 1).to_string().clone().into(),
             cost: get_semi_random_cost(&nodes),

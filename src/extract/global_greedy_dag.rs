@@ -1,12 +1,12 @@
 use std::iter;
 
-use rpds::{HashTrieMap, HashTrieSet};
+use rpds::HashTrieSet;
 
 use super::*;
 
 type TermId = usize;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct Term {
     op: String,
     children: Vec<TermId>,
@@ -41,7 +41,7 @@ impl TermDag {
     /// Makes a new term using a node and children terms
     /// Correctly computes total_cost with sharing
     /// If this term contains itself, returns None
-    /// If this term costs more than target, returns None
+    /// It can also return None if the cost of the term is greater than target
     pub fn make(
         &mut self,
         node_id: NodeId,
@@ -55,6 +55,8 @@ impl TermDag {
         };
 
         if let Some(id) = self.hash_cons.get(&term) {
+            eprintln!("Found shared term: {:?}", term);
+            eprintln!("Node: {:?}", node);
             return Some(*id);
         }
 
@@ -92,19 +94,16 @@ impl TermDag {
             let next_id = self.nodes.len();
 
             for child in children.iter() {
-                if cost > target {
+                if cost >= target {
                     return None;
                 }
                 let child_cost = self.get_cost(&mut reachable, *child);
                 cost += child_cost;
             }
 
-            if cost > target {
-                return None;
-            }
-
             reachable = reachable.insert(node.eclass.clone());
 
+            self.nodes.push(term.clone());
             self.info.push(TermInfo {
                 node: node_id,
                 node_cost,
@@ -113,7 +112,7 @@ impl TermDag {
                 reachable,
                 size: 1 + children.iter().map(|c| self.info[*c].size).sum::<usize>(),
             });
-            self.nodes.push(term.clone());
+
             self.hash_cons.insert(term, next_id);
             Some(next_id)
         }
@@ -151,53 +150,152 @@ impl TermDag {
     }
 }
 
+/// Choose terms from the term dag to form the extraction result.
+/// If something has already been chosen, stick to that choice (otherwise, cycles can result).
+fn choose_terms(result: &mut ExtractionResult, termdag: &TermDag, term: TermId) {
+    let terminfo = &termdag.info[term];
+    let term = &termdag.nodes[term];
+    let eclass = terminfo.eclass.clone();
+    if !result.choices.contains_key(&eclass) {
+        result.choose(eclass, terminfo.node.clone());
+        for child in &term.children {
+            choose_terms(result, termdag, *child);
+        }
+    }
+}
+
 pub struct GlobalGreedyDagExtractor;
 impl Extractor for GlobalGreedyDagExtractor {
-    fn extract(&self, egraph: &EGraph, _roots: &[ClassId]) -> ExtractionResult {
-        let mut keep_going = true;
+    fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
+        // 1. build map from class to parent nodes
+        let mut parents = IndexMap::<ClassId, Vec<NodeId>>::default();
+        let n2c = |nid: &NodeId| egraph.nid_to_cid(nid);
+
+        for class in egraph.classes().values() {
+            parents.insert(class.id.clone(), Vec::new());
+        }
+        for class in egraph.classes().values() {
+            for node in &class.nodes {
+                for c in &egraph[node].children {
+                    parents[n2c(c)].push(node.clone());
+                }
+            }
+        }
+
+        // 2. start analysis from leaves
+        let mut analysis_pending = UniqueQueue::default();
+
+        for class in egraph.classes().values() {
+            for node in &class.nodes {
+                if egraph[node].is_leaf() {
+                    analysis_pending.insert(node.clone());
+                }
+            }
+        }
 
         let nodes = egraph.nodes.clone();
         let mut termdag = TermDag::default();
         let mut best_in_class: HashMap<ClassId, TermId> = HashMap::default();
 
-        let mut i = 0;
-        while keep_going {
-            i += 1;
-            println!("iteration {}", i);
-            keep_going = false;
-
-            'node_loop: for (node_id, node) in &nodes {
-                let mut children: Vec<TermId> = vec![];
-                // compute the cost set from the children
-                for child in &node.children {
-                    let child_cid = egraph.nid_to_cid(child);
-                    if let Some(best) = best_in_class.get(child_cid) {
-                        children.push(*best);
-                    } else {
-                        continue 'node_loop;
-                    }
+        while let Some(node_id) = analysis_pending.pop() {
+            let node = &nodes[&node_id];
+            let class_id = n2c(&node_id);
+            let mut children: Vec<TermId> = vec![];
+            // compute the cost set from the children
+            for child in &node.children {
+                let child_cid = egraph.nid_to_cid(child);
+                if let Some(best) = best_in_class.get(child_cid) {
+                    children.push(*best);
+                } else {
+                    continue;
                 }
+            }
 
-                let old_cost = best_in_class
-                    .get(&node.eclass)
-                    .map(|id| termdag.total_cost(*id))
-                    .unwrap_or(INFINITY);
+            let old_cost = best_in_class
+                .get(&node.eclass)
+                .map(|id| termdag.total_cost(*id))
+                .unwrap_or(INFINITY);
 
-                if let Some(candidate) = termdag.make(node_id.clone(), node, children, old_cost) {
-                    let cadidate_cost = termdag.total_cost(candidate);
-
-                    if cadidate_cost < old_cost {
-                        best_in_class.insert(node.eclass.clone(), candidate);
-                        keep_going = true;
-                    }
+            if let Some(candidate) = termdag.make(node_id.clone(), node, children, old_cost) {
+                assert_eq!(termdag.info[candidate].eclass, node.eclass, "eclass mismatch- either a bug in global greedy dag, or the input benchmark doesn't maintain congruence");
+                let candidate_cost = termdag.total_cost(candidate);
+                if candidate_cost < old_cost {
+                    best_in_class.insert(node.eclass.clone(), candidate);
+                    analysis_pending.extend(parents[class_id].iter().cloned());
                 }
             }
         }
 
+        // TODO this algorithm can result in cycles
+        // the problem is that if roots has length greater than zero, then
+        // there will be two extracted programs, one for each root.
+        // However, we may need to make different choices for eclasses depending on the root,
+        // while the extraction gym currently only allows us one.
+
         let mut result = ExtractionResult::default();
-        for (class, term) in best_in_class {
-            result.choose(class, termdag.info[term].node.clone());
+        for root in roots {
+            choose_terms(&mut result, &termdag, best_in_class[root]);
         }
+        
         result
+    }
+}
+
+/** A data structure to maintain a queue of unique elements.
+
+Notably, insert/pop operations have O(1) expected amortized runtime complexity.
+*/
+#[derive(Clone)]
+#[cfg_attr(feature = "serde-1", derive(Serialize, Deserialize))]
+pub(crate) struct UniqueQueue<T>
+where
+    T: Eq + std::hash::Hash + Clone,
+{
+    set: std::collections::HashSet<T>, // hashbrown::
+    queue: std::collections::VecDeque<T>,
+}
+
+impl<T> Default for UniqueQueue<T>
+where
+    T: Eq + std::hash::Hash + Clone,
+{
+    fn default() -> Self {
+        UniqueQueue {
+            set: std::collections::HashSet::default(),
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<T> UniqueQueue<T>
+where
+    T: Eq + std::hash::Hash + Clone,
+{
+    pub fn insert(&mut self, t: T) {
+        if self.set.insert(t.clone()) {
+            self.queue.push_back(t);
+        }
+    }
+
+    pub fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        for t in iter.into_iter() {
+            self.insert(t);
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        let res = self.queue.pop_front();
+        res.as_ref().map(|t| self.set.remove(t));
+        res
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        let r = self.queue.is_empty();
+        debug_assert_eq!(r, self.set.is_empty());
+        r
     }
 }
